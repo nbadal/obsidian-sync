@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/mitchellh/mapstructure"
 	"io"
 	"log"
 )
@@ -28,11 +27,11 @@ func ListVaults(token string) ([]VaultInfo, error) {
 		}
 	}(resp.Body)
 
-	var data map[string]interface{}
+	var data map[string]json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, fmt.Errorf("could not decode vault list response: %v", err)
 	}
-	if errMsg, ok := data["error"].(string); ok {
+	if errMsg, ok := data["error"]; ok {
 		return nil, fmt.Errorf("server returned error: %s", errMsg)
 	}
 	if data["vaults"] == nil {
@@ -41,8 +40,8 @@ func ListVaults(token string) ([]VaultInfo, error) {
 
 	// Decode vaults and return
 	var vaults []VaultInfo
-	if err := mapstructure.Decode(data["vaults"], &vaults); err != nil {
-		return nil, fmt.Errorf("could not decode vaults: %v", err)
+	if err := json.Unmarshal(data["vaults"], &vaults); err != nil {
+		return nil, fmt.Errorf("could not decode vault list response: %v", err)
 	}
 	return vaults, nil
 }
