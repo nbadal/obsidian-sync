@@ -16,7 +16,7 @@ func ListVaults(token string) ([]VaultInfo, error) {
 		return nil, fmt.Errorf("could not create vault list request: %v", err)
 	}
 
-	// Send request
+	// send request
 	resp, err := SendPostRequest("/vault/list", body)
 	if err != nil {
 		return nil, fmt.Errorf("could not send vault list request: %v", err)

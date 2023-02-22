@@ -11,7 +11,7 @@ func Login(email, password string) (error, string) {
 	// Create request body
 	reqBody := []byte(fmt.Sprintf(`{"email":"%s","password":"%s"}`, email, password))
 
-	// Send request
+	// send request
 	resp, err := api.SendPostRequest("/user/signin", reqBody)
 	if err != nil {
 		return err, ""

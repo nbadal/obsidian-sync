@@ -12,6 +12,7 @@ func init() {
 	syncCmd.Flags().StringP("vaultId", "v", "", "Vault ID to sync")
 	syncCmd.Flags().StringP("password", "p", "", "Password to decrypt vault")
 	syncCmd.Flags().StringP("authToken", "t", "", "Auth token to use")
+	syncCmd.Flags().BoolP("daemon", "d", false, "Run as a daemon, continuously syncing in the background")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -24,8 +25,9 @@ var syncCmd = &cobra.Command{
 		vault, _ := cmd.Flags().GetString("vault")
 		password, _ := cmd.Flags().GetString("password")
 		authToken, _ := cmd.Flags().GetString("authToken")
+		daemon, _ := cmd.Flags().GetBool("daemon")
 
-		err := promptForNeededInfoThenSync(authToken, vault, password)
+		err := promptForNeededInfoThenSync(authToken, vault, password, daemon)
 		if err != nil {
 			fmt.Printf("Error syncing: %s\n", err)
 			return
@@ -33,7 +35,7 @@ var syncCmd = &cobra.Command{
 	},
 }
 
-func promptForNeededInfoThenSync(authToken, vaultId, password string) error {
+func promptForNeededInfoThenSync(authToken, vaultId, password string, daemon bool) error {
 	if authToken == "" {
 		// TODO: Get auth token if needed from config file
 		return fmt.Errorf("no auth token provided")
@@ -90,7 +92,7 @@ func promptForNeededInfoThenSync(authToken, vaultId, password string) error {
 	}
 
 	// Sync
-	err := sync.Sync(authToken, vaultInfo, password)
+	err := sync.Sync(authToken, vaultInfo, password, daemon)
 	if err != nil {
 		return fmt.Errorf("error syncing: %s", err)
 	}

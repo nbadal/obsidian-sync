@@ -14,16 +14,16 @@ import (
 )
 
 type IncomingPushMessage struct {
-	Op      string `json:"op"`
-	Path    string `json:"path"`
-	Hash    string `json:"hash"`
-	Size    int64  `json:"size"`
-	Ctime   int64  `json:"ctime"`
-	Mtime   int64  `json:"mtime"`
-	Folder  bool   `json:"folder"`
-	Deleted bool   `json:"deleted"`
-	Device  string `json:"device"`
-	Uid     int64  `json:"uid"`
+	Op            string `json:"op"`
+	EncryptedPath string `json:"path"`
+	EncryptedHash string `json:"hash"`
+	Size          int64  `json:"size"`
+	Ctime         int64  `json:"ctime"`
+	Mtime         int64  `json:"mtime"`
+	Folder        bool   `json:"folder"`
+	Deleted       bool   `json:"deleted"`
+	Device        string `json:"device"`
+	Uid           int64  `json:"uid"`
 }
 
 type OutgoingPushMessage struct {
@@ -46,42 +46,16 @@ type PullHeaderMessage struct {
 	Pieces int    `json:"pieces"`
 }
 
-type ReadyMessage struct {
-	Op      string `json:"op"`
-	Version int    `json:"version"`
-}
-
-// PullSession represents a session for a specific push operation
-type PullSession struct {
-	UID  int64
-	Path string
-	Hash string
-}
-
-type ObsidianFile struct {
-	Path      string
-	LatestUID int64
-}
-
 type ObsidianSocketContext struct {
-	ws                *websocket.Conn
-	Vault             VaultInfo
-	handlers          *MessageHandlers
-	authToken         string
-	keyhash           string
-	MessageLog        chan string
-	unhandledMessages chan []byte
+	ws             *websocket.Conn
+	Vault          VaultInfo
+	PingSignal     chan bool
+	IncomingPushes chan IncomingPushMessage
+	authToken      string
+	keyhash        string
 }
 
-type MessageHandler func(ctx *ObsidianSocketContext, msg []byte) error
-
-type MessageHandlers struct {
-	opMessageHandlers    map[string]MessageHandler
-	noOpMessageHandler   MessageHandler
-	binaryMessageHandler MessageHandler
-}
-
-func ConnectToVault(vault VaultInfo, password string, authToken string, handlers *MessageHandlers) (*ObsidianSocketContext, error) {
+func ConnectToVault(vault VaultInfo, password string, authToken string) (*ObsidianSocketContext, error) {
 	// Generate keyhash for vault
 	keyhash, err := crypto.KeyHash([]byte(password), []byte(vault.Salt))
 	if err != nil {
@@ -95,34 +69,15 @@ func ConnectToVault(vault VaultInfo, password string, authToken string, handlers
 	}
 
 	ctx := &ObsidianSocketContext{
-		ws:                conn,
-		Vault:             vault,
-		authToken:         authToken,
-		keyhash:           keyhash,
-		handlers:          handlers,
-		MessageLog:        make(chan string, 100),
-		unhandledMessages: make(chan []byte, 100),
+		ws:        conn,
+		Vault:     vault,
+		authToken: authToken,
+		keyhash:   keyhash,
 	}
-
-	// Start handling messages
-	go func() {
-		err := ctx.handleMessages()
-		if err != nil {
-			log.Fatalf("error handling messages: %v", err)
-		}
-	}()
-
-	// Start listening for messages
-	go func() {
-		err := ctx.listenForMessages()
-		if err != nil {
-			log.Fatalf("error listening for messages: %v", err)
-		}
-	}()
 
 	// Start sending pings to keep the connection alive
 	go func() {
-		err := ctx.keepAlive()
+		err := ctx.startPingTimer()
 		if err != nil {
 			log.Fatalf("error sending pings: %v", err)
 		}
@@ -131,104 +86,23 @@ func ConnectToVault(vault VaultInfo, password string, authToken string, handlers
 	return ctx, nil
 }
 
-// listenForMessages listens for messages from the websocket and sends them to the message queue
-func (ctx *ObsidianSocketContext) listenForMessages() error {
-	for {
-		_, message, err := ctx.ws.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("could not read message: %v", err)
-		}
-		ctx.unhandledMessages <- message
+// nextMessage returns the next message from the websocket
+func (ctx *ObsidianSocketContext) nextMessage() ([]byte, error) {
+	_, msg, err := ctx.ws.ReadMessage()
+	if err != nil {
+		return nil, fmt.Errorf("error reading message: %v", err)
 	}
-}
-
-// getNextUnhandledMessage gets the next message from the message queue and logs it
-func (ctx *ObsidianSocketContext) getNextUnhandledMessage() []byte {
-	message := <-ctx.unhandledMessages
-	data := make(map[string]interface{})
-	if err := json.Unmarshal(message, &data); err != nil {
-		ctx.MessageLog <- fmt.Sprintf("⏪ Binary [%d]", len(message))
+	var data map[string]interface{}
+	if err := json.Unmarshal(msg, &data); err != nil {
+		fmt.Printf("⏪ Binary [%d]\n", len(msg))
 	} else {
-		ctx.MessageLog <- "⏪ " + string(message)
+		fmt.Printf("⏪ %s\n", msg)
 	}
-	return message
+	return msg, nil
 }
 
-// handleMessages handles messages from the message queue
-func (ctx *ObsidianSocketContext) handleMessages() error {
-	var num = 1
-	for {
-		ctx.MessageLog <- fmt.Sprintf("Handling message %d", num)
-		message := ctx.getNextUnhandledMessage()
-		if err := ctx.handleMessage(message); err != nil {
-			return fmt.Errorf("error handling message: %v", err)
-		}
-		ctx.MessageLog <- fmt.Sprintf("Handled message %d", num)
-		num++
-	}
-}
-
-// handleMessage routes a message to the correct handler, if one exists
-func (ctx *ObsidianSocketContext) handleMessage(bytes []byte) error {
-	data := make(map[string]interface{})
-	if err := json.Unmarshal(bytes, &data); err == nil {
-		if op, ok := data["op"]; ok {
-			// Ignore pong messages
-			if op.(string) == "pong" {
-				return nil
-			}
-
-			// Handle op messages
-			if handler, ok := ctx.handlers.opMessageHandlers[op.(string)]; ok {
-				if err := handler(ctx, bytes); err != nil {
-					return fmt.Errorf("error handling op (%s) message: %v", op.(string), err)
-				}
-			} else {
-				return fmt.Errorf("no handler for op: %s", op)
-			}
-		} else {
-			// Handle messages without an op
-			if ctx.handlers.noOpMessageHandler != nil {
-				if err := ctx.handlers.noOpMessageHandler(ctx, bytes); err != nil {
-					return fmt.Errorf("error handling no-op message: %v", err)
-				}
-			} else {
-				return fmt.Errorf("no handler for message without op")
-			}
-		}
-	} else {
-		// Handle binary messages
-		if ctx.handlers.binaryMessageHandler != nil {
-			if err := ctx.handlers.binaryMessageHandler(ctx, bytes); err != nil {
-				return fmt.Errorf("error handling binary message: %v", err)
-			}
-		} else {
-			return fmt.Errorf("no handler for binary message")
-		}
-	}
-	return nil
-}
-
-// RegisterOpHandler registers a callback for a specific op type
-func (h *MessageHandlers) RegisterOpHandler(op string, callback MessageHandler) {
-	if h.opMessageHandlers == nil {
-		h.opMessageHandlers = make(map[string]MessageHandler)
-	}
-	h.opMessageHandlers[op] = callback
-}
-
-// RegisterNoOpHandler registers a callback for a message without an op
-func (h *MessageHandlers) RegisterNoOpHandler(callback MessageHandler) {
-	h.noOpMessageHandler = callback
-}
-
-// RegisterBinaryHandler registers a callback for a message that cant be unmarshalled
-func (h *MessageHandlers) RegisterBinaryHandler(callback MessageHandler) {
-	h.binaryMessageHandler = callback
-}
-
-// Send sends a message to the websocket
-func (ctx *ObsidianSocketContext) Send(msg interface{}) error {
+// send sends a message to the websocket
+func (ctx *ObsidianSocketContext) sendMessage(msg interface{}) error {
 	if err := ctx.ws.WriteJSON(msg); err != nil {
 		return fmt.Errorf("could not send message: %v", err)
 	}
@@ -238,7 +112,7 @@ func (ctx *ObsidianSocketContext) Send(msg interface{}) error {
 	if err != nil {
 		return fmt.Errorf("could not marshal message: %v", err)
 	}
-	ctx.MessageLog <- "⏩ " + string(jsonMsg)
+	fmt.Printf("⏩ %s\n", jsonMsg)
 
 	return nil
 }
@@ -249,27 +123,29 @@ func (ctx *ObsidianSocketContext) SendBinary(msg []byte) error {
 	}
 
 	// Log binary message
-	ctx.MessageLog <- fmt.Sprintf("⏩ Binary [%d]", len(msg))
+	fmt.Printf("⏩ Binary [%d]\n", len(msg))
 
 	return nil
 }
 
-// keepAlive sends a ping message every 20-30 seconds to keep the connection alive
-func (ctx *ObsidianSocketContext) keepAlive() error {
+// startPingTimer sends a ping message every 20-30 seconds to keep the connection alive
+func (ctx *ObsidianSocketContext) startPingTimer() error {
 	for {
+		// Sleep for 20-30 seconds
 		time.Sleep(time.Duration(rand.Intn(10)+20) * time.Second)
-		if err := ctx.Send(struct {
-			Op string `json:"op"`
-		}{
-			Op: "ping",
-		}); err != nil {
-			return err
-		}
+
+		// Flag to send ping
+		ctx.PingSignal <- true
 	}
 }
 
+type InitResult struct {
+	RemoteUid   int64
+	PushedFiles []IncomingPushMessage
+}
+
 // SendInit sends the initial JSON message to the websocket
-func (ctx *ObsidianSocketContext) SendInit() error {
+func (ctx *ObsidianSocketContext) SendInit() (*InitResult, error) {
 	initialMsg := struct {
 		Op      string `json:"op"`
 		ID      string `json:"id"`
@@ -287,11 +163,63 @@ func (ctx *ObsidianSocketContext) SendInit() error {
 		Initial: true,            // TODO: False if this isn't our first sync
 		Device:  "obsidian-sync", // TODO: Allow a device name override
 	}
-	if err := ctx.Send(initialMsg); err != nil {
-		return fmt.Errorf("could not send initial message: %v", err)
+	if err := ctx.sendMessage(initialMsg); err != nil {
+		return nil, fmt.Errorf("could not send init message: %v", err)
 	}
 
-	return nil
+	// Next message should be an {res: ok}
+	response, err := ctx.nextMessage()
+	if err != nil {
+		return nil, fmt.Errorf("error reading message: %v", err)
+	}
+	var data struct {
+		Res string `json:"res"`
+	}
+	if err := json.Unmarshal(response, &data); err != nil {
+		return nil, fmt.Errorf("error unmarshalling message: %v", err)
+	}
+	if data.Res != "ok" {
+		return nil, fmt.Errorf("expected ok message, got %s", data.Res)
+	}
+
+	var pushedFiles []IncomingPushMessage
+	var remoteUid int64
+	for {
+		response, err := ctx.nextMessage()
+		if err != nil {
+			return nil, fmt.Errorf("error reading message: %v", err)
+		}
+
+		var data map[string]interface{}
+		if err := json.Unmarshal(response, &data); err != nil {
+			return nil, fmt.Errorf("error unmarshalling message: %v", err)
+		}
+
+		if data["op"] == "push" {
+			var fileData IncomingPushMessage
+			if err := json.Unmarshal(response, &fileData); err != nil {
+				return nil, fmt.Errorf("error unmarshalling push message: %v", err)
+			}
+			pushedFiles = append(pushedFiles, fileData)
+		} else if data["op"] == "ready" {
+			var readyData struct {
+				Op  string `json:"op"`
+				Uid int64  `json:"version"`
+			}
+			if err := json.Unmarshal(response, &readyData); err != nil {
+				return nil, fmt.Errorf("error unmarshalling ready message: %v", err)
+			}
+			remoteUid = readyData.Uid
+			break
+		} else {
+			return nil, fmt.Errorf("expected push or ready message, got %s", response)
+		}
+	}
+
+	return &InitResult{
+		RemoteUid:   remoteUid,
+		PushedFiles: pushedFiles,
+	}, nil
 }
 
 func (ctx *ObsidianSocketContext) Close() {
@@ -301,18 +229,22 @@ func (ctx *ObsidianSocketContext) Close() {
 	}
 }
 
-func (ctx *ObsidianSocketContext) SendAndHandleSizeOp() error {
-	// Send size op
-	if err := ctx.Send(struct {
+// GetSizeConfig returns the size and limit of the vault
+func (ctx *ObsidianSocketContext) GetSizeConfig() (int64, int64, error) {
+	// send size op
+	if err := ctx.sendMessage(struct {
 		Op string `json:"op"`
 	}{
 		Op: "size",
 	}); err != nil {
-		return fmt.Errorf("could not send size op: %v", err)
+		return 0, 0, fmt.Errorf("could not send size message: %v", err)
 	}
 
 	// Next message should be a size response
-	response := ctx.getNextUnhandledMessage()
+	response, err := ctx.nextMessage()
+	if err != nil {
+		return 0, 0, fmt.Errorf("error reading size message: %v", err)
+	}
 
 	type SizeResponse struct {
 		Size  int64 `json:"size"`
@@ -320,20 +252,16 @@ func (ctx *ObsidianSocketContext) SendAndHandleSizeOp() error {
 	}
 	var sizeResponse SizeResponse
 	if err := json.Unmarshal(response, &sizeResponse); err != nil {
-		return fmt.Errorf("could not unmarshal size response: %v", err)
+		return 0, 0, fmt.Errorf("error unmarshalling size message: %v", err)
 	}
 
-	ctx.MessageLog <- fmt.Sprintf("Size: %d/%d", sizeResponse.Size, sizeResponse.Limit)
-
-	// TODO: What does this size response represent?
-
-	return nil
+	return sizeResponse.Size, sizeResponse.Limit, nil
 }
 
 // PullFile initiates a pull for a file, which should send a header and binary data
 // TODO: This should also support a deletion result
-func (ctx *ObsidianSocketContext) PullFile(uid int64, expectedHash string) ([]byte, error) {
-	// Send a pull op for this UID
+func (ctx *ObsidianSocketContext) PullFile(uid int64, expectedEncryptedHash string) ([]byte, error) {
+	// send a pull op for this UID
 	pullMsg := struct {
 		Op  string `json:"op"`
 		UID int64  `json:"uid"`
@@ -342,28 +270,34 @@ func (ctx *ObsidianSocketContext) PullFile(uid int64, expectedHash string) ([]by
 		UID: uid,
 	}
 
-	if err := ctx.Send(pullMsg); err != nil {
+	if err := ctx.sendMessage(pullMsg); err != nil {
 		return nil, fmt.Errorf("could not send pull message: %v", err)
 	}
 
 	// Next message should be a header
-	header := ctx.getNextUnhandledMessage()
+	header, err := ctx.nextMessage()
+	if err != nil {
+		return nil, fmt.Errorf("error reading header: %v", err)
+	}
 
 	// Unmarshal pull header message
 	var headerMessage PullHeaderMessage
-	err := json.Unmarshal(header, &headerMessage)
+	err = json.Unmarshal(header, &headerMessage)
 	if err != nil {
 		return nil, fmt.Errorf("could not unmarshal pull header message: %v", err)
 	}
 
-	ctx.MessageLog <- fmt.Sprintf("ℹ️ Received header for %d", uid)
-	ctx.MessageLog <- fmt.Sprintf("ℹ️ Size: %d", headerMessage.Size)
-	ctx.MessageLog <- fmt.Sprintf("ℹ️ Pieces: %d", headerMessage.Pieces)
+	fmt.Printf("ℹ️ Received header for %d\n", uid)
+	fmt.Printf("ℹ️ Size: %d\n", headerMessage.Size)
+	fmt.Printf("ℹ️ Pieces: %d\n", headerMessage.Pieces)
 
 	var data []byte
 	// Intercept N websocket messages and append them to the session data
 	for i := 0; i < headerMessage.Pieces; i++ {
-		message := ctx.getNextUnhandledMessage()
+		message, err := ctx.nextMessage()
+		if err != nil {
+			return nil, fmt.Errorf("error reading piece: %v", err)
+		}
 		data = append(data, message...)
 	}
 
@@ -381,7 +315,14 @@ func (ctx *ObsidianSocketContext) PullFile(uid int64, expectedHash string) ([]by
 	//Ensure the SHA-256 encryptedHash matches
 	contentSum := sha256.Sum256(decryptedData)
 
-	expectedHashBytes, err := hex.DecodeString(expectedHash)
+	// Decrypt the expected hash
+	decryptedExpectedHash, err := crypto.DecryptString(expectedEncryptedHash, []byte(ctx.Vault.Password), []byte(ctx.Vault.Salt))
+	if err != nil {
+		return nil, fmt.Errorf("could not decrypt expected hash: %v", err)
+	}
+
+	// Decode the expected hash
+	expectedHashBytes, err := hex.DecodeString(decryptedExpectedHash)
 	if err != nil {
 		return nil, fmt.Errorf("could not decode expected hash: %v", err)
 	}
@@ -428,12 +369,15 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 		Pieces:  1,
 	}
 
-	if err := ctx.Send(message); err != nil {
+	if err := ctx.sendMessage(message); err != nil {
 		return fmt.Errorf("could not send push message: %v", err)
 	}
 
 	// Next message should be a {"res": "next"}
-	response := ctx.getNextUnhandledMessage()
+	response, err := ctx.nextMessage()
+	if err != nil {
+		return fmt.Errorf("error reading next response: %v", err)
+	}
 	var nextResponse struct {
 		Res string `json:"res"`
 	}
@@ -444,13 +388,16 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 		return fmt.Errorf("next response is not 'next'")
 	}
 
-	// Send the encrypted content
+	// send the encrypted content
 	if err := ctx.SendBinary(encryptedContent); err != nil {
 		return fmt.Errorf("could not send encrypted content: %v", err)
 	}
 
 	// Next message should be an incoming push
-	response = ctx.getNextUnhandledMessage()
+	response, err = ctx.nextMessage()
+	if err != nil {
+		return fmt.Errorf("error reading push response: %v", err)
+	}
 	var pushResponse IncomingPushMessage
 	if err := json.Unmarshal(response, &pushResponse); err != nil {
 		return fmt.Errorf("could not unmarshal push response: %v", err)
@@ -458,7 +405,10 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 	// TODO: Make sure the incoming push response matches the outgoing push message
 
 	// Next message should be an {"op": "ok"}
-	response = ctx.getNextUnhandledMessage()
+	response, err = ctx.nextMessage()
+	if err != nil {
+		return fmt.Errorf("error reading ok response: %v", err)
+	}
 	var okResponse struct {
 		Op string `json:"op"`
 	}
@@ -470,4 +420,70 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 	}
 
 	return nil
+}
+
+func (ctx *ObsidianSocketContext) WaitForPushMessage() (*IncomingPushMessage, error) {
+	// Send ping message every 20-30s until we get a push message then return
+	resultChan := make(chan *IncomingPushMessage)
+	errorChan := make(chan error)
+	doneChan := make(chan bool)
+
+	// Start pinging until we get a push message, then signal that we're done
+	var unansweredPingCount = 0
+	go func() {
+		for {
+			message, err := ctx.nextMessage()
+			if err != nil {
+				errorChan <- fmt.Errorf("error reading message: %v", err)
+			}
+			var data map[string]interface{}
+			if err := json.Unmarshal(message, &data); err != nil {
+				errorChan <- fmt.Errorf("could not unmarshal message: %v", err)
+			}
+			if data["op"] == "push" {
+				var pushMessage IncomingPushMessage
+				if err := json.Unmarshal(message, &pushMessage); err != nil {
+					errorChan <- fmt.Errorf("could not unmarshal push message: %v", err)
+				}
+				resultChan <- &pushMessage
+
+				// Stop listening if we've got a push and no unanswered pings
+				if unansweredPingCount == 0 {
+					doneChan <- true
+					return
+				}
+			} else if data["op"] == "pong" {
+				unansweredPingCount--
+			} else {
+				errorChan <- fmt.Errorf("unexpected message: %v", string(message))
+			}
+		}
+	}()
+
+	// Ping until done
+	go func() {
+		for {
+			secs := rand.Intn(10) + 20
+			select {
+			case <-time.After(time.Duration(secs) * time.Second):
+				if err := ctx.sendMessage(struct {
+					Op string `json:"op"`
+				}{
+					Op: "ping",
+				}); err != nil {
+					errorChan <- fmt.Errorf("could not send ping message: %v", err)
+				}
+				unansweredPingCount++
+			case <-doneChan:
+				return
+			}
+		}
+	}()
+
+	select {
+	case result := <-resultChan:
+		return result, nil
+	case err := <-errorChan:
+		return nil, err
+	}
 }

@@ -17,7 +17,7 @@ func SendPostRequest(endpoint string, body []byte) (*http.Response, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "app://obsidian.md")
 
-	// Send request
+	// send request
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("could not send request: %v", err)
