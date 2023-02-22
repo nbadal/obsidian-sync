@@ -46,7 +46,7 @@ func getTokenIfNeededAndStore(token, email, password string) {
 	}
 
 	// Login and store token
-	err, token := auth.Login(email, password)
+	token, err := auth.Login(email, password)
 	if err != nil {
 		fmt.Printf("Error logging in: %s\n", err)
 		return

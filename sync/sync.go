@@ -52,6 +52,9 @@ func Sync(authToken string, vault api.VaultInfo, password string, daemon bool) e
 	// Get size info
 	fmt.Println("📊 Getting size info...")
 	size, limit, err := ctx.GetSizeConfig()
+	if err != nil {
+		return fmt.Errorf("error getting size info: %s", err)
+	}
 
 	// Create sync state
 	syncState := State{
@@ -118,9 +121,7 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 				if localFile.Modified > remoteFile.Modified {
 					conflictPaths = append(conflictPaths, path)
 				}
-			} else {
-				// We don't care about mismatches for folders
-			}
+			} // We don't care about mismatches for folders
 		} else {
 			// Pull the file or create a folder
 			if remoteFile.IsFolder {
@@ -144,9 +145,7 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 			if localFile.Created < s.LastSync {
 				deletePaths = append(deletePaths, path)
 			}
-		} else {
-			// These cases handled above
-		}
+		} // else cases handled above
 	}
 
 	// Print out summary
