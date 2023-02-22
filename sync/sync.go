@@ -5,6 +5,7 @@ import (
 	"github.com/nbadal/obsidian-sync/api"
 	"github.com/nbadal/obsidian-sync/crypto"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type ObsidianLocalEntry struct {
 }
 
 type State struct {
+	TargetPath    string
 	LocalFiles    map[string]ObsidianLocalEntry
 	RemoteEntries map[string]ObsidianRemoteEntry
 	LastSync      int64
@@ -32,7 +34,7 @@ type State struct {
 	Limit         int64
 }
 
-func Sync(authToken string, vault api.VaultInfo, password string, daemon bool) error {
+func Sync(targetPath string, authToken string, vault api.VaultInfo, password string, daemon bool) error {
 	// Create websocket API connection
 	ctx, err := api.ConnectToVault(vault, password, authToken)
 	if err != nil {
@@ -58,6 +60,7 @@ func Sync(authToken string, vault api.VaultInfo, password string, daemon bool) e
 
 	// Create sync state
 	syncState := State{
+		TargetPath:    targetPath,
 		LocalFiles:    make(map[string]ObsidianLocalEntry),
 		RemoteEntries: make(map[string]ObsidianRemoteEntry),
 		Size:          size,
@@ -136,14 +139,12 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 	for path, localFile := range s.LocalFiles {
 		remoteFile, inRemote := s.RemoteEntries[path]
 		if !inRemote {
-			// Push if file is modified newer
-			if localFile.Modified > remoteFile.Modified {
-				pushPaths = append(pushPaths, path)
-			}
-
-			// Delete if file was created before last sync
 			if localFile.Created < s.LastSync {
+				// Delete if file was created before last sync
 				deletePaths = append(deletePaths, path)
+			} else if localFile.Modified > remoteFile.Modified {
+				// Push if file is modified newer
+				pushPaths = append(pushPaths, path)
 			}
 		} // else cases handled above
 	}
@@ -175,13 +176,14 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 			return fmt.Errorf("error decrypting path: %s", err)
 		}
 
-		fmt.Printf("🗑️ Deleting %s\n", decryptedPath)
+		fullPath := filepath.Join(s.TargetPath, decryptedPath)
+		fmt.Printf("🗑️ Deleting %s\n", fullPath)
 
 		// Delete from os
-		//err := os.RemoveAll(decryptedPath)
-		//if err != nil {
-		//	return fmt.Errorf("error deleting file: %s", err)
-		//}
+		err = os.RemoveAll(fullPath)
+		if err != nil {
+			return fmt.Errorf("error deleting file: %s", err)
+		}
 
 		// Delete from local entries
 		delete(s.LocalFiles, path)
@@ -195,13 +197,14 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 			return fmt.Errorf("error decrypting path: %s", err)
 		}
 
-		fmt.Printf("📁 Creating folder %s\n", decryptedPath)
+		fullPath := filepath.Join(s.TargetPath, decryptedPath)
+		fmt.Printf("📁 Creating folder %s\n", fullPath)
 
 		// Create folder
-		//err := os.MkdirAll(decryptedPath, 0755)
-		//if err != nil {
-		//	return fmt.Errorf("error creating folder: %s", err)
-		//}
+		err = os.MkdirAll(fullPath, 0755)
+		if err != nil {
+			return fmt.Errorf("error creating folder: %s", err)
+		}
 
 		// Add folder to local entries
 		s.LocalFiles[path] = ObsidianLocalEntry{
@@ -219,7 +222,8 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 		}
 
 		pullEntry := s.RemoteEntries[path]
-		fmt.Printf("📄 Pulling file %s version %d\n", decryptedPath, pullEntry.Uid)
+		fullPath := filepath.Join(s.TargetPath, decryptedPath)
+		fmt.Printf("📄 Pulling file %s version %d\n", fullPath, pullEntry.Uid)
 		content, err := ws.PullFile(pullEntry.Uid, pullEntry.EncryptedHash)
 		if err != nil {
 			return fmt.Errorf("error pulling file: %s", err)
@@ -230,10 +234,10 @@ func (s *State) SyncFiles(ws *api.ObsidianSocketContext) error {
 		fmt.Printf("%s\n", string(content))
 
 		// Write file to disk
-		//err = os.WriteFile(path, content, 0644)
-		//if err != nil {
-		//	return fmt.Errorf("error writing file to disk: %s", err)
-		//}
+		err = os.WriteFile(fullPath, content, 0644)
+		if err != nil {
+			return fmt.Errorf("error writing file to disk: %s", err)
+		}
 
 		// Update local state
 		s.LocalFiles[path] = ObsidianLocalEntry{

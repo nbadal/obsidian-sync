@@ -61,6 +61,7 @@ func getTokenIfNeededAndStore(token, email, password string) {
 func promptFor(prompt string, value *string) {
 	fmt.Print(prompt)
 	_, err := fmt.Scanln(value)
+	// TODO: Support empty input (throws unexpected newline error)
 	if err != nil {
 		fmt.Printf("Error reading input: %s\n", err)
 		return
