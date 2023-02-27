@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/nbadal/obsidian-sync/crypto"
-	"log"
 	"math/rand"
 	"time"
 )
@@ -40,19 +39,17 @@ type OutgoingPushMessage struct {
 }
 
 type PullHeaderMessage struct {
-	Op     string `json:"op"`
 	Hash   string `json:"hash"`
 	Size   int64  `json:"size"`
 	Pieces int    `json:"pieces"`
 }
 
 type ObsidianSocketContext struct {
-	ws             *websocket.Conn
-	Vault          VaultInfo
-	PingSignal     chan bool
-	IncomingPushes chan IncomingPushMessage
-	authToken      string
-	keyhash        string
+	ws            *websocket.Conn
+	Vault         VaultInfo
+	authToken     string
+	keyhash       string
+	filteredQueue [][]byte
 }
 
 func ConnectToVault(vault VaultInfo, password string, authToken string) (*ObsidianSocketContext, error) {
@@ -62,81 +59,20 @@ func ConnectToVault(vault VaultInfo, password string, authToken string) (*Obsidi
 		return nil, fmt.Errorf("error generating keyhash: %s", err)
 	}
 
+	ctx := &ObsidianSocketContext{
+		Vault:         vault,
+		authToken:     authToken,
+		keyhash:       keyhash,
+		filteredQueue: [][]byte{},
+	}
+
 	// Connect to websocket
-	conn, _, err := websocket.DefaultDialer.Dial("wss://"+vault.Host+"/", nil)
+	err = ctx.connect(vault.Host)
 	if err != nil {
 		return nil, fmt.Errorf("error connecting to websocket: %s", err)
 	}
 
-	ctx := &ObsidianSocketContext{
-		ws:        conn,
-		Vault:     vault,
-		authToken: authToken,
-		keyhash:   keyhash,
-	}
-
-	// Start sending pings to keep the connection alive
-	go func() {
-		err := ctx.startPingTimer()
-		if err != nil {
-			log.Fatalf("error sending pings: %v", err)
-		}
-	}()
-
 	return ctx, nil
-}
-
-// nextMessage returns the next message from the websocket
-func (ctx *ObsidianSocketContext) nextMessage() ([]byte, error) {
-	_, msg, err := ctx.ws.ReadMessage()
-	if err != nil {
-		return nil, fmt.Errorf("error reading message: %v", err)
-	}
-	var data map[string]interface{}
-	if err := json.Unmarshal(msg, &data); err != nil {
-		fmt.Printf("⏪ Binary [%d]\n", len(msg))
-	} else {
-		fmt.Printf("⏪ %s\n", msg)
-	}
-	return msg, nil
-}
-
-// send sends a message to the websocket
-func (ctx *ObsidianSocketContext) sendMessage(msg interface{}) error {
-	if err := ctx.ws.WriteJSON(msg); err != nil {
-		return fmt.Errorf("could not send message: %v", err)
-	}
-
-	// Log JSON message
-	jsonMsg, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("could not marshal message: %v", err)
-	}
-	fmt.Printf("⏩ %s\n", jsonMsg)
-
-	return nil
-}
-
-func (ctx *ObsidianSocketContext) SendBinary(msg []byte) error {
-	if err := ctx.ws.WriteMessage(websocket.BinaryMessage, msg); err != nil {
-		return fmt.Errorf("could not send message: %v", err)
-	}
-
-	// Log binary message
-	fmt.Printf("⏩ Binary [%d]\n", len(msg))
-
-	return nil
-}
-
-// startPingTimer sends a ping message every 20-30 seconds to keep the connection alive
-func (ctx *ObsidianSocketContext) startPingTimer() error {
-	for {
-		// Sleep for 20-30 seconds
-		time.Sleep(time.Duration(rand.Intn(10)+20) * time.Second)
-
-		// Flag to send ping
-		ctx.PingSignal <- true
-	}
 }
 
 type InitResult struct {
@@ -168,7 +104,7 @@ func (ctx *ObsidianSocketContext) SendInit() (*InitResult, error) {
 	}
 
 	// Next message should be an {res: ok}
-	response, err := ctx.nextMessage()
+	response, err := ctx.nextMessageWithJsonValue("res", "ok")
 	if err != nil {
 		return nil, fmt.Errorf("error reading message: %v", err)
 	}
@@ -185,7 +121,9 @@ func (ctx *ObsidianSocketContext) SendInit() (*InitResult, error) {
 	var pushedFiles []IncomingPushMessage
 	var remoteUid int64
 	for {
-		response, err := ctx.nextMessage()
+		response, err := ctx.nextMessageMatchingJson(func(json map[string]interface{}) bool {
+			return json["op"] == "push" || json["op"] == "ready"
+		})
 		if err != nil {
 			return nil, fmt.Errorf("error reading message: %v", err)
 		}
@@ -222,13 +160,6 @@ func (ctx *ObsidianSocketContext) SendInit() (*InitResult, error) {
 	}, nil
 }
 
-func (ctx *ObsidianSocketContext) Close() {
-	err := ctx.ws.Close()
-	if err != nil {
-		panic(err)
-	}
-}
-
 // GetSizeConfig returns the size and limit of the vault
 func (ctx *ObsidianSocketContext) GetSizeConfig() (int64, int64, error) {
 	// send size op
@@ -241,7 +172,7 @@ func (ctx *ObsidianSocketContext) GetSizeConfig() (int64, int64, error) {
 	}
 
 	// Next message should be a size response
-	response, err := ctx.nextMessage()
+	response, err := ctx.nextMessageWithJsonKeys("size", "limit")
 	if err != nil {
 		return 0, 0, fmt.Errorf("error reading size message: %v", err)
 	}
@@ -275,7 +206,7 @@ func (ctx *ObsidianSocketContext) PullFile(uid int64, expectedEncryptedHash stri
 	}
 
 	// Next message should be a header
-	header, err := ctx.nextMessage()
+	header, err := ctx.nextMessageWithJsonKeys("hash", "size", "pieces")
 	if err != nil {
 		return nil, fmt.Errorf("error reading header: %v", err)
 	}
@@ -294,7 +225,7 @@ func (ctx *ObsidianSocketContext) PullFile(uid int64, expectedEncryptedHash stri
 	var data []byte
 	// Intercept N websocket messages and append them to the session data
 	for i := 0; i < headerMessage.Pieces; i++ {
-		message, err := ctx.nextMessage()
+		message, err := ctx.nextBinaryMessage()
 		if err != nil {
 			return nil, fmt.Errorf("error reading piece: %v", err)
 		}
@@ -366,7 +297,7 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 		Folder:  folder,
 		Deleted: deleted,
 		Size:    int64(len(encryptedContent)),
-		Pieces:  1,
+		Pieces:  1, // TODO: 2MB chunks
 	}
 
 	if err := ctx.sendMessage(message); err != nil {
@@ -374,7 +305,7 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 	}
 
 	// Next message should be a {"res": "next"}
-	response, err := ctx.nextMessage()
+	response, err := ctx.nextMessageWithJsonValue("res", "next")
 	if err != nil {
 		return fmt.Errorf("error reading next response: %v", err)
 	}
@@ -389,12 +320,14 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 	}
 
 	// send the encrypted content
-	if err := ctx.SendBinary(encryptedContent); err != nil {
+	if err := ctx.sendBinary(encryptedContent); err != nil {
 		return fmt.Errorf("could not send encrypted content: %v", err)
 	}
 
+	// TODO: Loop this next+binary pair for each 2MB chunk of the file
+
 	// Next message should be an incoming push
-	response, err = ctx.nextMessage()
+	response, err = ctx.nextMessageWithJsonValue("op", "push")
 	if err != nil {
 		return fmt.Errorf("error reading push response: %v", err)
 	}
@@ -405,7 +338,7 @@ func (ctx *ObsidianSocketContext) PushFile(path string, extension string, ctime 
 	// TODO: Make sure the incoming push response matches the outgoing push message
 
 	// Next message should be an {"op": "ok"}
-	response, err = ctx.nextMessage()
+	response, err = ctx.nextMessageWithJsonValue("op", "ok")
 	if err != nil {
 		return fmt.Errorf("error reading ok response: %v", err)
 	}
@@ -432,7 +365,9 @@ func (ctx *ObsidianSocketContext) WaitForPushMessage() (*IncomingPushMessage, er
 	var unansweredPingCount = 0
 	go func() {
 		for {
-			message, err := ctx.nextMessage()
+			message, err := ctx.nextMessageMatchingJson(func(json map[string]interface{}) bool {
+				return json["op"] == "push" || json["op"] == "pong"
+			})
 			if err != nil {
 				errorChan <- fmt.Errorf("error reading message: %v", err)
 			}
