@@ -76,7 +76,7 @@ func (ctx *ObsidianSocketContext) nextMessageWithJsonValue(key string, value int
 	})
 }
 
-// nextMessageWithJsonValues returns the next binary (non-JSON) message from the websocket
+// nextBinaryMessage returns the next binary (non-JSON) message from the websocket
 func (ctx *ObsidianSocketContext) nextBinaryMessage() ([]byte, error) {
 	return ctx.nextMessageMatching(func(msg []byte) bool {
 		// Message is binary if we can't unmarshal JSON
