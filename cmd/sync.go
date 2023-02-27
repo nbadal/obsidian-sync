@@ -155,6 +155,7 @@ func promptForNeededInfoThenSync(targetPath, authToken, vaultId, password string
 			promptFor("Vault Password: ", &password)
 		}
 	}
+	vaultInfo.Password = password
 
 	// Sync
 	err := sync.Sync(targetPath, authToken, vaultInfo, password, daemon)
